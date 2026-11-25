@@ -12,10 +12,10 @@
 //   - Never chase a vertical spike: if the coin already ran hard before the
 //     filter fires, the entry is skipped. No FOMO entries, ever.
 //   - Small positions, quick exits: a small fixed slice of the bankroll per
-//     trade. Bank half the gain early (scale out at +25%), let the rest ride
-//     to +50% or a trailing fade. Cut every loser fast with a hard -10% stop.
+//     trade. Bank half the gain early (scale out at +15%), let the rest ride
+//     to +30% or a trailing fade. Cut every loser fast with a hard -6% stop.
 //   - Cash is a position: when no coin meets the filter, hold cash and wait.
-//   - Minutes, not hours: positions last minutes; a 10-minute max hold.
+//   - Minutes, not hours: positions last minutes; a 5-minute max hold.
 //   - Risk caps: a per-trade loss cap (the hard stop), a maximum position
 //     size, and a drawdown cap that halts new entries for the rest of the
 //     replay if the bankroll falls 10% below its start.
@@ -43,6 +43,23 @@
 //     last trade's post-trade reserves; the bot never needs to flatten.
 //   - stdout is the protocol channel: nothing but replies is ever written
 //     there. Diagnostics, if any, go to stderr.
+//
+// Revision 2 (after the second dev grading: -0.839 SOL, and one rugged coin
+// drew 39,016 rejected sells): a rejected sell now pauses that mint's exits
+// for 300 batches instead of retrying every batch, dust positions (worth
+// less than 3x the tx fee) are not sold at all, and cash already committed
+// by unfilled buys is reserved so consecutive batches cannot overcommit it.
+// (A distinct-buyers entry filter was tried here and dropped: it cost more
+// winners than it saved.)
+//
+// Revision 3 (after the third dev grading: -0.886 SOL): the rest of a
+// position rode to +100% instead of +30% with a looser 15% trailing fade,
+// because the dev runs showed the biggest wins came from coins that kept
+// climbing past +30%. Graded: -0.927 SOL, win rate 18.2% — the runners
+// gave it all back on the fade, so revision 3 was REVERTED: TP2 is back to
+// +30% and the trail to 8%. Final configuration = revision 1 thresholds
+// (+15%/+30%/-6%/5-min hold, gain >=12%, still rising) + revision 2
+// robustness (sell-retry cooldown, dust skip, cash reservation).
 
 type BuyOrder = {
   side: "buy";
@@ -63,23 +80,31 @@ type SellOrder = {
 type Order = BuyOrder | SellOrder;
 
 // ---- Tunable thresholds (tune ONLY these; never the strategy's shape) ----
+// Revision 1 (after the first dev grading: -1.006 SOL, 18% win rate — the
+// first version banked too late and cut losers too slowly, so most entries
+// rode the retrace): bank sooner, cut faster, hold shorter, and only enter
+// while the move is still climbing. Same strategy shape, tighter discipline.
 const ENTRY_MAX_AGE_S = 180; // enter only in a coin's first 3 minutes
-const ENTRY_MIN_GAIN = 1.08; // price up at least 8% from its first print
+const ENTRY_MIN_GAIN = 1.12; // price up at least 12% from its first print
 const ENTRY_MAX_GAIN = 1.45; // already up >45%? Never chase the vertical
 const ENTRY_MIN_BUY_VOL_LAMPORTS = 1_000_000_000n; // >= 1 SOL of buys, last 60s
 const ENTRY_MIN_BUYS_60S = 5; // at least 5 buy trades, last 60s
 const ENTRY_MIN_REAL_SOL_LAMPORTS = 2_000_000_000n; // >= 2 SOL real reserves
+const ENTRY_STILL_RISING = 1.01; // price now >= 1% above its print ~30s ago
 const TARGET_POSITION_LAMPORTS = 100_000_000n; // 0.10 SOL per trade
 const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL (guardrail needs >= 0.01)
-const TAKE_PROFIT_1 = 1.25; // bank half at +25%
-const TAKE_PROFIT_2 = 1.5; // exit the rest at +50%
-const STOP_LOSS = 0.9; // hard stop: sell all at -10%
-const TRAILING_DROP = 0.88; // after a +25% peak, sell if price fades 12% off peak
-const MAX_HOLD_S = 600; // 10 minutes, then out whatever the price
+const TAKE_PROFIT_1 = 1.15; // bank half at +15% (was +25%: bank sooner)
+const TAKE_PROFIT_2 = 1.3; // exit the rest at +30% (revision 3 tried +100% with a 15% trail: win rate fell to 18.2%, net worsened to -0.927 SOL — the runners gave it all back)
+const STOP_LOSS = 0.94; // hard stop: sell all at -6% (was -10%: cut faster)
+const TRAILING_DROP = 0.92; // after a +15% peak, sell if price fades 8% off peak
+const MAX_HOLD_S = 300; // 5 minutes, then out whatever the price (was 10)
 const DRAWDOWN_HALT = 0.9; // halt new entries below 90% of starting capital
-const MAX_SLIPPAGE_BPS = 500; // 5%: pump.fun moves fast in 2 slots
+const MAX_SLIPPAGE_BPS = 500; // 5% on buys: never overpay for an entry
+const SELL_SLIPPAGE_BPS = 1000; // 10% on sells: a rejected exit leaves you holding a dump
 const VOL_WINDOW_S = 60; // buy-volume window for the entry filter
 const TX_FEE_LAMPORTS = 105_000n; // base 5,000 + priority 100,000 per order
+const SELL_RETRY_COOLDOWN_BATCHES = 300; // after a sell is REJECTED, wait this many batches before retrying that mint
+const DUST_VALUE_LAMPORTS = 315_000n; // 3x tx fees: below this a position is not worth selling (the engine writes it off at end of data)
 
 // ---- Per-mint market state, built from the batch events ----
 interface MintState {
@@ -89,6 +114,7 @@ interface MintState {
   lastTs: number;
   realSol: bigint;
   buys: { ts: number; sol: bigint }[];
+  snaps: { ts: number; price: number }[]; // price snapshots, for the still-rising check
   complete: boolean;
 }
 
@@ -109,8 +135,11 @@ const mints = new Map<string, MintState>();
 const positions = new Map<string, PositionState>();
 const traded = new Set<string>(); // one shot per mint: never re-enter after exit
 const pending = new Map<string, PendingOrder>(); // client_id -> order
+const pendingBuySpend = new Map<string, bigint>(); // client_id -> quote + tx fees reserved by an unfilled buy
+const sellCooldown = new Map<string, number>(); // mint -> batch seq until which sells are paused (after a rejection)
 
 let nowTs = 0;
+let currentSeq = 0;
 let initialCapital = 10_000_000_000n;
 let maxOpenPositions = 5;
 let maxOrdersPerBatch = 16;
@@ -161,6 +190,7 @@ function handleHello(msg: any): void {
 
 function handleBatch(msg: any): Order[] {
   const orders: Order[] = [];
+  if (typeof msg.seq === "number") currentSeq = msg.seq;
 
   // ---- 1. Fold the batch's events into per-mint state. ----
   const events: any[] = Array.isArray(msg.events) ? msg.events : [];
@@ -181,6 +211,7 @@ function handleBatch(msg: any): Order[] {
           lastTs: ts,
           realSol: 0n,
           buys: [],
+          snaps: [{ ts, price: p }],
           complete: false,
         });
       }
@@ -196,12 +227,15 @@ function handleBatch(msg: any): Order[] {
           lastTs: ts,
           realSol: 0n,
           buys: [],
+          snaps: [],
           complete: false,
         };
         mints.set(mint, m);
       }
       m.lastPrice = p;
       m.lastTs = ts;
+      m.snaps.push({ ts, price: p });
+      while (m.snaps.length > 0 && m.snaps[0]!.ts < nowTs - 120) m.snaps.shift();
       if (typeof e.real_sol_reserves === "string") m.realSol = BigInt(e.real_sol_reserves);
       if (e.is_buy === true) {
         m.buys.push({ ts, sol: BigInt(e.sol_amount) });
@@ -216,15 +250,22 @@ function handleBatch(msg: any): Order[] {
   }
 
   // ---- 2. Settle fills: clear pending orders, record filled scale-outs. ----
+  // A rejected sell is usually persistent (a drained curve rejects every
+  // retry), so pause that mint's exits for a while instead of spamming a
+  // sell every batch. A failed tx is transient: retry on the next batch.
   const fills: any[] = Array.isArray(msg.fills) ? msg.fills : [];
   for (const f of fills) {
     if (!f || typeof f.client_id !== "string") continue;
     const p = pending.get(f.client_id);
     if (!p) continue;
     pending.delete(f.client_id);
+    pendingBuySpend.delete(f.client_id);
     if (f.status === "filled" && p.kind === "tp1") {
       const pos = positions.get(p.mint);
       if (pos) pos.tp1Done = true;
+    }
+    if (f.status === "rejected" && (p.kind === "sell" || p.kind === "tp1")) {
+      sellCooldown.set(p.mint, currentSeq + SELL_RETRY_COOLDOWN_BATCHES);
     }
   }
 
@@ -285,9 +326,16 @@ function handleBatch(msg: any): Order[] {
     const st = positions.get(mint);
     if (!st || st.entryPrice <= 0) continue;
     if (pendingHasMint(mint, "sell") || pendingHasMint(mint, "tp1")) continue;
+    const blockedUntil = sellCooldown.get(mint) ?? 0;
+    if (currentSeq < blockedUntil) continue; // a rejected sell waits out its cooldown
     const tokens = BigInt(pos.token_amount);
     if (tokens <= 0n) continue;
     const cur = marks.get(mint) ?? mints.get(mint)?.lastPrice ?? st.entryPrice;
+    // Dust is not worth selling: the payout would not cover the tx fees,
+    // so the engine rejects the sell (and writes the tokens off at the end
+    // of the data). Skip the order; if the price recovers, exits resume.
+    if (BigInt(Math.floor(Number(tokens) * cur)) < DUST_VALUE_LAMPORTS) continue;
+    if (cash < TX_FEE_LAMPORTS) continue; // cannot even pay the tx fee
     const entry = st.entryPrice;
     let sellTokens: bigint | null = null;
     if (cur <= entry * STOP_LOSS) {
@@ -311,7 +359,7 @@ function handleBatch(msg: any): Order[] {
         client_id: id,
         mint,
         token_amount: sellTokens.toString(),
-        max_slippage_bps: MAX_SLIPPAGE_BPS,
+        max_slippage_bps: SELL_SLIPPAGE_BPS,
       });
     }
   }
@@ -329,6 +377,15 @@ function handleBatch(msg: any): Order[] {
       if (m.firstPrice <= 0 || m.lastPrice <= 0) continue;
       const gain = m.lastPrice / m.firstPrice;
       if (gain < ENTRY_MIN_GAIN || gain > ENTRY_MAX_GAIN) continue;
+      // Still climbing, not already rolling over: compare with the oldest
+      // snapshot at least ~25s old. A coin younger than that has no history
+      // to check, so it passes on the gain + volume filters alone.
+      let oldSnap: { ts: number; price: number } | null = null;
+      for (const s of m.snaps) {
+        if (nowTs - s.ts >= 25) oldSnap = s;
+        else break;
+      }
+      if (oldSnap && oldSnap.price > 0 && m.lastPrice < oldSnap.price * ENTRY_STILL_RISING) continue;
       if (m.realSol < ENTRY_MIN_REAL_SOL_LAMPORTS) continue;
       const v60 = buyVolume(m, nowTs - VOL_WINDOW_S, nowTs);
       if (v60.sol < ENTRY_MIN_BUY_VOL_LAMPORTS || v60.n < ENTRY_MIN_BUYS_60S) continue;
@@ -343,6 +400,12 @@ function handleBatch(msg: any): Order[] {
       if (a.vol !== b.vol) return a.vol > b.vol ? -1 : 1;
       return a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0;
     });
+    // Cash the account reports is stale until pending buys resolve (2 slots
+    // later), so reserve what unfilled buys already committed; otherwise
+    // consecutive batches overcommit and the buys die insufficient_cash.
+    let reserved = 0n;
+    for (const v of pendingBuySpend.values()) reserved += v;
+    let spendable = cash - reserved;
     for (const c of candidates) {
       if (orders.length >= maxOrdersPerBatch) break;
       if (positions.size + orders.filter((o) => o.side === "buy").length >= maxOpenPositions) break;
@@ -351,9 +414,11 @@ function handleBatch(msg: any): Order[] {
       const capByReserve = (m.realSol * BigInt(maxOrderBps - 10)) / 10000n;
       let size = TARGET_POSITION_LAMPORTS < capByReserve ? TARGET_POSITION_LAMPORTS : capByReserve;
       if (size < MIN_BUY_LAMPORTS) continue;
-      if (size + TX_FEE_LAMPORTS > cash) continue;
+      if (size + TX_FEE_LAMPORTS > spendable) continue;
       const id = nextClientId();
       pending.set(id, { mint: c.mint, kind: "buy" });
+      pendingBuySpend.set(id, size + TX_FEE_LAMPORTS);
+      spendable -= size + TX_FEE_LAMPORTS;
       orders.push({
         side: "buy",
         client_id: id,
@@ -361,7 +426,6 @@ function handleBatch(msg: any): Order[] {
         quote_lamports: size.toString(),
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
-      cash -= size + TX_FEE_LAMPORTS; // reserve cash for this reply's buys
       traded.add(c.mint);
     }
   }
